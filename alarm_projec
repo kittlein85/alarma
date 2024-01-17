@@ -1,0 +1,1632 @@
+//  Berreizeta  
+//  ALARMA POR PIR Y CONTACTOS MAGNETICOS POR APERTURA
+//  Control por teclado keypad o mando remoto, receptor de 433mhz o 315mhz
+//------------------------------------------------------------------------------
+// el PIR se adjusta en monodisparo, tiempo activado al mínimo y sensibilidad la que
+// se necesite para cubir la estancia donde se coloque
+
+//  *****   VERSION PARA LCD 1602 I2C   *****
+
+#include <Wire.h>
+#include <Keypad.h>       // Libreria Keypad
+#include <RCSwitch.h>     // Libreria receptor 433mhz
+#include <EEPROM.h>
+#include <LiquidCrystal_I2C.h>
+
+// LiquidCrystal_I2C lcd(0x3F, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);  // comprobar la direcciín del IC2
+LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);     // comprobar la direcciín del IC2
+
+RCSwitch mySwitch = RCSwitch();
+
+//------------------------------------------------------------------------------
+char codeA[5]  = "6001";   // Variable que contiene el PIN Fijo.
+char codeB[5]  = "6002";   // Variable que contiene el PIN Fijo.
+char pindata[5] = "5555";  // Variable que contiene el PIN2 ver datos y Modif claves.
+char pinrdata[5] = "0000"; // Variable que contiene el PIN3 borrar datos.
+char puk[9] = "66666666";   // Variable que contiene el número PUK.
+
+char code1[5];    // Pin en eeprom modificable por teclado
+char code2[5];    // Pin en eeprom modificable por teclado
+char code3[5];    // Pin en eeprom modificable por teclado
+
+int remoteA = 6001;   //  = CodeA u otro
+int remoteB = 6002;   //  = CodeB u otro
+int remoteC = 5555;   //  = Pindata
+int remoteD = 9999;   //  = Alarma de pánico
+
+String keydata;
+int posicion = 0;
+const byte rows = 4;           // Número de filas del teclado.
+const byte cols = 3;           // Número de columnas del teclado.
+char keys[rows][cols] = {      // Array de filas y columnas del teclado.
+{'1','2','3'},
+{'4','5','6'},
+{'7','8','9'},
+{'*','0','#'}
+};
+
+byte rowPins[rows] = {12, 11, 10, 9}; // Asignación de pines de arduino para las filas del teclado.
+byte colPins[cols] = {8, 7, 6}; // Asignación de pines de arduino para las columnas del teclado.
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, rows, cols);
+
+byte magnet = A0;      // Pin de entrada para interruptores magnéticos.
+int pir3 = 5;          // Pines de entrada para sensor de presencia.
+int pir2 = 4;
+int pir1 = 3;
+// PIN D2 RESERVADO --> 433MHZ RECEPTOR  !!!  Usa interrupciones de sistema (pin 2 ó 3)
+
+
+byte leds = A1;    // Pin de salida para los leds de estado de la alarma.
+byte sirena = A2;  // Pin de salida para el relé que activa la sirena.
+byte buzzer = A3;  // Pin de salida para el buzzer.
+
+int cod = 0;
+int lastcode;      //  ultimo codigo utilizado
+int actualcode;    //  codigo actual 
+int estado = 0;        // Variable donde se almacena el estado de la alarma.
+int cntInt = 0;    // Contador de intentos para el código PIN y PUK.
+int cntRem = 0;    // Contador de recepcion del mendo remoto erroneos.
+
+long tiempo;       // Variable para guardar tiempo.
+char key;          // Variable de lectura de teclado.
+boolean claveBien = false; // Variable que indica la clave es correcta.
+boolean claveMal = false;  // Variable que indica la clave es errónea.
+
+int x = 0, mrest, luz = 0, secs, srest;
+int timepin = 10000;        // tiempo para teclear la clave
+int timeluz = 20000;        // tiempo que se mantiene encendido el backlight del lcd
+int twatch1 = 5000;        // hasta 20 segundos  tiempo de activación
+int twatch2 = 5000;        // Hasta 32 segundos  Tiempo de desactivación
+//long twatch1 = 35000;     // A partir de 33 segundos usar "long" en lugar de "int"
+//long twatch2 = 45000;     // A partir de 33 segundos usar "long" en lugar de "int"
+unsigned long watchmillis, watchluz, iniciomillis,rearmado = 300000;
+int value = 0, sube = 1, intrus, alarms, det1, det2, det3, detM;
+int pirsound = 1;
+//----------------------------------------------------------------------------------------
+void setup(){
+
+     Wire.begin(); // Inicializamos el bus I2C. 
+//   Serial.begin(9600); // Se establece la velocidad de transmisión en 9600 Bauds.
+
+     lcd.begin(16, 2); // Se inicializa la pantalla del LCD con 16 columnas y 2 filas.
+  
+     mySwitch.enableReceive(0);  // Receiver on interrupt 0 => that is pin D2  (interrup 1 => pin D3)
+     delay(500);
+
+   pinMode(pir1, INPUT);         // pir1 es una entrada.
+   pinMode(pir2, INPUT);         // pir2 es una entrada.
+   pinMode(pir3, INPUT);         // pir3 es una entrada.   
+   pinMode(magnet, INPUT);       // magnet es una entrada.
+   pinMode(leds, OUTPUT);        // leds es una salida.
+   pinMode(sirena, OUTPUT);      // sirena es una salida. (activa un transistor o un relé)
+   pinMode(buzzer, OUTPUT);      // buzzer es una salida.
+
+//  lcd.backlight();
+//  lcd.noBacklight();  
+  lcd.setBacklight(1);
+  luz = 1;
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("**   ALARM   ** ");
+  lcd.setCursor(0,1); 
+  lcd.print(" Pir & Sensors  ");
+  delay(2000);
+  lcd.clear();
+  lcd.setCursor(6,0);
+  lcd.print("Berreizeta");
+  lcd.setCursor(4,1);
+  lcd.print("v.04.05.2020");
+  delay(3000);
+  lcd.clear();
+  beep();
+  delay(50);
+  beep();
+  watchluz = millis();
+
+// weprom();  //  descomentar para grabar la eeprom por primera vez luego poner = //
+              //  y volver a cargar el programa o utilizar el programa adjunto eeprom.ino
+
+reprom();     //  leer la eeprom
+  
+}  //  end setup
+//------------------------------------------------------------------------------
+void loop(){ 
+
+//-------------------------------------------------
+while (estado == 8){
+
+key = keypad.getKey();
+
+if (millis() - iniciomillis >= 15000){
+lcd.clear();  
+estado = 0;
+}
+
+if (key == '1'){
+beep();  
+delay(50); 
+watchluz = millis();
+//   mySwitch.resetAvailable();
+lcd.clear();
+estado = 0;
+EEPROM.update(0, estado);
+}   // end key 1
+
+   secs = 10 - (millis() - iniciomillis)/1000;
+   if (secs > 9){
+   lcd.setCursor(14,0);
+   } else {
+   lcd.setCursor(14,0);
+   lcd.print(" ");  
+   lcd.setCursor(15,0);
+   } 
+   lcd.print(secs);
+
+// a los 10seg pasa a estado_0
+if (millis() - iniciomillis >= 10000){   
+  beep1();
+  delay(200);
+  beep1();
+  estado = 0;
+  EEPROM.update(0, estado);
+  lcd.clear();
+}
+
+if (key == '2'){
+beep();  
+lcd.clear();
+lcd.setBacklight(1);
+delay(50);
+ 
+  lcd.setCursor(0,0);
+  lcd.print("MODIFICACION");
+  lcd.setCursor(0,1);
+  lcd.print("DE CLAVES");
+  delay(1000);
+  lcd.clear();
+  
+  lcd.setCursor(0,0);
+  lcd.print("1:");
+  lcd.setCursor(3,0);
+  lcd.print(code1);
+  
+  lcd.setCursor(0,1);
+  lcd.print("2:");
+  lcd.setCursor(3,1);
+  lcd.print(code2);
+
+  lcd.setCursor(8,0);
+  lcd.print("3:");
+  lcd.setCursor(11,0);
+  lcd.print(code3);
+
+  lcd.setCursor(8,1);
+  lcd.print("*:");
+  lcd.setCursor(11,1);
+  lcd.print("Salir");  
+  
+estado = 81;
+}   //  end if key 2
+
+}   // end estado 8
+///-------------------------------------------
+while (estado == 81){
+  
+key = keypad.getKey();
+
+if (key == '*'){
+beep();
+lcd.clear();
+estado = 8;
+screen1();
+}
+
+if (key == '1'){
+beep();
+lcd.setBacklight(1);
+lcd.clear();
+
+  lcd.setCursor(0,0);
+  lcd.print("1 - ");
+  lcd.setCursor(4,0);
+  lcd.print(code1);
+
+  lcd.setCursor(0,1);
+  lcd.print("NEW CLAVE:"); 
+cod = 1;
+estado = 9;
+}   // end key 1
+
+if (key == '2'){
+ beep(); 
+lcd.setBacklight(1);
+lcd.clear();
+
+  lcd.setCursor(0,0);
+  lcd.print("2 - ");
+  lcd.setCursor(4,0);
+  lcd.print(code2);
+
+  lcd.setCursor(0,1);
+  lcd.print("NEW CLAVE:"); 
+cod = 2;
+estado = 9;
+}   // end key 2
+
+if (key == '3'){
+beep();  
+lcd.setBacklight(1);
+lcd.clear();
+
+  lcd.setCursor(0,0);
+  lcd.print("3 - ");
+  lcd.setCursor(4,0);
+  lcd.print(code3);
+
+  lcd.setCursor(0,1);
+  lcd.print("NEW CLAVE:"); 
+cod = 3;
+estado = 9;
+}   // end key 3
+
+}   // end while estado 81
+//----------------------------------------------------------------------------------------- 
+while (estado == 9){
+
+key = keypad.getKey();
+
+if (key == '*' || key == '#'){
+beep();
+lcd.setBacklight(1);
+watchluz = millis();
+luz = 1;
+delay(50);
+}
+
+if (key >= '0'){
+  beep();  
+  posicion ++;
+  keydata = keydata + key;
+  lcd.setCursor(10 + posicion,1);
+  lcd.print(key);
+  delay(100);
+}
+
+if (posicion == 4){
+
+  if (cod == 1){
+  keydata.toCharArray(code1,5);
+  EEPROM.put(5, code1);
+  cod = 0;
+  }
+   
+  if (cod == 2){
+  keydata.toCharArray(code2,5);
+  EEPROM.put(10, code2);
+  cod = 0;
+  }
+   
+  if (cod == 3){
+  keydata.toCharArray(code3,5); 
+  EEPROM.put(15, code3);
+  cod = 0;
+  } 
+   
+  lcd.clear();
+  digitalWrite(buzzer, HIGH);
+  delay(50);
+  digitalWrite(buzzer, LOW);
+  lcd.setCursor(0, 0);
+  lcd.print("clave: ");
+  lcd.setCursor(7, 0);
+  lcd.print(keydata);    
+  lcd.setCursor(0, 1);  
+  lcd.print("Guardada");
+  keydata = "";
+  key = "";
+  posicion = 0;
+  delay(1000);
+//  }   // end posicion
+
+reprom();        // read eprom
+estado = 8;
+screen1();
+}   // end posicion4
+}  // end estado 9
+
+//-----------------------------------------------------------------------------------------  
+/* ESTADO 0
+  En el siguiente estado (estado '0') la alarma está apagada y necesita una clave para poderse activar ////
+  El programa comienza su ejecución en este estado y realizará de forma secuencial las siguientes acciones:
+- Comprobar si hay un dato en el puerto serie (a través de la subrutina puertoSerie()).
+- Poner a nivel bajo las salidas leds, sirena y buzzer.
+- Indicar en la pantalla LCD qué la alarma está inactiva.
+- Comprobar si se ha marcado algún número (a través de la subrutina clavePin()).
+- Verificar si el número marcado es el correcto (claveBien o claveMal).
+Después de la verificación del número marcado, el programa irá al estado que le corresponda y notificará el cambio a la aplicación de c# enviando un dato a través del puerto serie.
+*/
+
+while (estado == 0){
+
+//   EEPROM.update(0, estado);
+
+digitalWrite(sirena, LOW);
+digitalWrite(buzzer, LOW);
+lcd.setCursor(0, 0);
+lcd.print("Alarm: OFF");
+lcd.setCursor(0, 1);       
+lcd.print("ActivatePin");
+
+
+if (millis() - watchluz >= timeluz && luz == 1){
+  lcd.setBacklight(0);
+  luz = 0;
+ } 
+
+if (key == '*'){
+beep();
+lcd.setBacklight(1);
+watchluz = millis();
+pirsound = 1;
+luz = 1;
+delay(50);
+}
+if (key == '#'){
+beep();
+lcd.setBacklight(1);
+watchluz = millis();
+pirsound = 0;
+luz = 1;
+delay(50);
+}
+  
+//----------------------------------  //  detección PIR con alarma en OFF
+if (digitalRead(pir1) == HIGH){
+  det1++;
+  if (det1 == 1){        // solo una vez mientras este en high el PIR, ajustar el pir el mínimo tiempo
+  if (pirsound == 1){ beep();} 
+  digitalWrite(leds, HIGH);  
+  lcd.setBacklight(1);
+  watchluz = millis();
+  luz = 1;
+  lcd.setCursor(11, 0);
+  lcd.print("1");
+  }      //  end if det1
+} else {
+  det1 = 0;  
+  lcd.setCursor(11, 0);
+  lcd.print(" ");
+  }
+if (digitalRead(pir2) == HIGH){
+  det2++;
+  if (det2 == 1){  
+  if (pirsound == 1){ beep();}  
+  lcd.setBacklight(1);
+  watchluz = millis();
+  luz = 1;
+  digitalWrite(leds, HIGH); 
+  lcd.setCursor(13, 0);
+  lcd.print("2");
+  }  
+} else {
+  det2 = 0; 
+  lcd.setCursor(13, 0);
+  lcd.print(" ");
+}
+if (digitalRead(pir3) == HIGH){
+  det3++;
+  if (det3 == 1){  
+  if (pirsound == 1){ beep();}  
+  lcd.setBacklight(1);
+  watchluz = millis();
+  luz = 1;  
+  digitalWrite(leds, HIGH); 
+  lcd.setCursor(15, 0);
+  lcd.print("3");
+  }  
+} else {
+  det3 = 0;  
+  lcd.setCursor(15, 0);
+  lcd.print(" ");   
+}
+if (analogRead(magnet) == HIGH){
+  detM++;
+  if (detM == 1){  
+  if (pirsound == 1){ beep();}  
+  lcd.setBacklight(1);
+  watchluz = millis();
+  luz = 1;  
+  digitalWrite(leds, HIGH); 
+  lcd.setCursor(14, 0);
+  lcd.print("M");
+  }  
+} else {
+  detM = 0;  
+  lcd.setCursor(14, 0);
+  lcd.print(" ");
+}
+//------------------------------------------------
+
+  if (digitalRead(pir1) == LOW &&
+      digitalRead(pir2) == LOW &&
+      digitalRead(pir3) == LOW){
+      digitalWrite(leds, LOW);
+     }
+/*
+digitalWrite(sirena, LOW);
+digitalWrite(buzzer, LOW);
+lcd.setCursor(0, 0);
+lcd.print("Alarm: OFF");
+lcd.setCursor(0, 1);       
+lcd.print("ActivatePin");
+*/
+clavePin2();
+
+if (posicion >= 1){
+lcd.setCursor(11 + posicion, 1);
+lcd.print("*");
+} else {
+  lcd.setCursor(12, 1);
+  lcd.print("____");  
+}
+
+// si no se teclean los 4 digitos, a los 10seg borra los tecleados
+if (millis() - iniciomillis >= timepin && posicion >0 && posicion <4){   
+  posicion = 0;
+  keydata = "";
+  delay(500);
+  beep1();  
+  lcd.setCursor(12, 1);
+  lcd.print("----"); 
+  delay(100);
+  beep1();
+  delay(100);  
+  beep1();  
+  lcd.setCursor(12, 1);
+  lcd.print("    ");  
+}
+
+  if (keydata == pindata){
+    data();
+    screen1();    
+    watchluz = millis(); 
+    iniciomillis = millis();
+    claveBien = false;  
+    keydata = "";
+    estado = 8;
+    EEPROM.update(0, estado);
+  }   // end keydata pindata
+
+ if (keydata == pinrdata){
+  lcd.clear();
+  beep();
+  lcd.setCursor(0,0);
+  lcd.print(" Data -> ERASED ");
+  beep();
+  intrus = 0;
+  alarms = 0;
+//  lastcode = 0;                // si se quiere resetear el lastcode
+//  actualcode = 0;              // si se quiere resetear el lastcode
+  EEPROM.put(20, intrus);
+  EEPROM.put(22, alarms);
+//  EEPROM.put(2, lastcode);     // si se quiere resetear el lastcode y grabarlo a 0
+//  EEPROM.put(24, actualcode);  // si se quiere resetear el actualcode y grabarlo a 0
+  keydata = "";
+  value = 0;
+  delay(500);
+  watchluz = millis(); 
+  lcd.clear();
+  claveBien = false;
+  }
+
+value = 0;
+remote();
+
+ if (value == remoteC){
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300);    
+    data();    
+    value = 0;    
+    watchluz = millis();
+    luz = 1; 
+    claveBien = false;
+ }
+ 
+  if (value == remoteD){
+  beep();
+  lcd.setCursor(12, 1);
+  lcd.print("****");
+  delay(300); 
+  lcd.clear();
+  estado = 4;
+  EEPROM.update(0, estado);
+  watchmillis = millis();
+  watchluz = millis(); 
+  lcd.clear();
+  luz = 1;
+  keydata = "";
+  value = 0;
+  alarms++;
+  claveBien = false;
+  }
+   
+if (claveBien || value == remoteA || value == remoteB){
+beep();
+keydata = ""; 
+estado = 1;
+EEPROM.update(0, estado);
+if (value == remoteA || value == remoteB){
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300);
+    }    
+lcd.clear();
+value = 0;
+lcd.setBacklight(1); 
+watchmillis = millis();
+watchluz = millis();
+claveBien = false;
+} else if (claveMal){
+estado = 5;
+EEPROM.update(0, estado);
+beep();
+lcd.clear();
+lcd.setBacklight(1); 
+watchmillis = millis();
+watchluz = millis();
+luz = 1;
+keydata = "";
+claveMal = false;
+} 
+
+}  // end while estado0
+//----------------------------------------------
+
+/*  ESTADO 1
+  En el siguiente estado (estado '1'), la alarma acaba de activarse, 
+  pero no estará operativa hasta que pasen 30 segundos 
+  En este estado, el programa realizará de forma secuencial las siguientes acciones:
+- Poner a nivel alto el indicador de alarma activa (led verde).
+- Indicar en la pantalla LCD qué la alarma se conectará pasados 20 segundos.
+- El programa espera 30 segundos.
+- Posteriormente, el programa pasa a estado '2'.
+- Notifica el cambio a través del puerto serie.
+*/
+
+while (estado == 1){
+
+//   EEPROM.update(0, estado);
+  
+  if (millis() - watchluz >= timeluz && luz == 1){    
+  lcd.setBacklight(0);
+  luz = 0;
+ } 
+
+digitalWrite(leds, LOW);
+delay(50);
+digitalWrite(leds, HIGH);
+delay(5);
+digitalWrite(leds, LOW);
+digitalWrite(sirena, LOW);
+digitalWrite(buzzer, LOW);
+
+lcd.setCursor(0, 0);
+lcd.print("Alarm: R E A D Y");
+lcd.setCursor(0, 1);
+lcd.print("Active in");
+lcd.setCursor(13, 1);
+lcd.print("sec");
+
+
+        srest = (((watchmillis + twatch1) - millis()) % 60000) ;
+        secs = srest /1000;
+        
+        if (srest - (secs * 1000) <= 100){
+        digitalWrite(buzzer, HIGH);
+        delay(25);
+        digitalWrite(buzzer, LOW); 
+        }
+        if (secs > 9){
+        lcd.setCursor(10,1);
+        }
+        else {
+        lcd.setCursor(10,1);
+        lcd.print("0");  
+        lcd.setCursor(11,1);
+        } 
+        lcd.print(secs);
+
+clavePin();
+remote();       
+
+
+if (claveBien || value == remoteA || value == remoteB){
+beep();  
+estado = 0;
+EEPROM.update(0, estado);
+delay(50);
+beep();
+
+if (value == remoteA || value == remoteB){
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300);
+}   
+lcd.clear();
+watchluz = millis();
+luz = 1;
+value = 0;
+claveBien = false;
+}
+
+if (claveMal){
+estado = 5;
+EEPROM.update(0, estado);
+beep();
+lcd.clear();
+lcd.setBacklight(1); 
+watchmillis = millis();
+watchluz = millis();
+luz = 1;
+claveMal = false;
+} 
+
+if (watchmillis + twatch1 <= millis()){
+estado = 2;
+EEPROM.update(0, estado);
+beep();
+lcd.clear();
+watchluz = millis();
+lcd.setBacklight(1); 
+luz = 1;
+value = 0;
+x = 0;
+sube = 1;
+}
+
+}  // end while estado1
+//----------------------------------------------
+
+/* ESTADO 2
+  En el siguiente estado (estado '2') la alarma está operativa e 
+  inspecciona si un intruso ha entrado en casa.
+  En este estado, el programa realizará de forma secuencial las siguientes acciones:
+- Comprobar si hay un dato en el puerto serie (a través de la subrutina puertoSerie()).
+- Poner a nivel alto solo el indicador de alarma activa (led verde).
+- Indicar en la pantalla LCD qué la alarma está operativa.
+- Verificar si el sensor pir o los interruptores de puerta han detectado algún intruso.
+En el caso de detectar a algún intruso, el programa irá al estado que le corresponda y notificará el cambio a la aplicación de c# enviando un dato a través del puerto serie.
+*/
+
+while (estado == 2){
+
+//   EEPROM.update(0, estado);
+/*
+if (millis() - watchluz >= timeluz && luz == 1){  
+  lcd.setBacklight(0);
+  luz = 0;
+ }
+*/
+if (sube == 1){ x++;}
+if (sube == 0){ x--;}
+
+digitalWrite(leds, HIGH);
+digitalWrite(sirena, LOW);
+digitalWrite(buzzer, LOW);
+lcd.setCursor(0, 0);
+lcd.print(" *  A L A R M  *");
+
+if (sube == 1 && x == 16){
+delay(30);  
+lcd.setCursor(0, 1);
+lcd.print("                 ");
+digitalWrite(leds, HIGH);
+sube = 0;
+}
+
+if (sube == 0 && x == 0){
+delay(30);  
+lcd.setCursor(0, 1);
+lcd.print("                 ");
+digitalWrite(leds, LOW);
+sube = 1;
+}
+
+delay(25);
+lcd.setCursor(x, 1);
+lcd.print(".");
+
+clavePin();
+remote();
+
+
+if (claveBien || value == remoteA || value == remoteB){
+estado = 0;
+EEPROM.update(0, estado);
+beep();
+delay(50);
+beep();
+
+if (value == remoteA || value == remoteB){
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300); 
+  } 
+
+lcd.clear();
+watchluz = millis();
+luz = 1;
+value = 0;
+claveBien = false;
+}
+
+else if (claveMal){
+estado = 6;
+EEPROM.update(0, estado);
+watchluz = millis(); 
+beep();
+lcd.clear();
+luz = 1;
+claveMal = false;
+}
+
+ if (digitalRead(pir1) == HIGH ||
+    digitalRead(pir1) == HIGH ||
+    digitalRead(pir2) == HIGH ||
+    digitalRead(pir3) == HIGH ||
+    analogRead(magnet) == HIGH){
+      
+estado = 3;
+EEPROM.update(0, estado);
+beep();
+lcd.clear();
+intrus++;
+if (intrus >= 999){ intrus = 0;}
+EEPROM.put(20, intrus);
+delay(50);
+}
+
+}  // end while estado2
+//----------------------------------------------
+
+/*  ESTADO 3
+  En el siguiente estado (estado '3') la alarma acaba de detectar un intruso 
+  y pondrá en funcionamiento la sirena si en 20 segundos no se introduce el código PIN ////
+  En este estado y durante 20 segundos, el programa realizará de forma secuencial las siguientes acciones:
+- Comprobar si hay un dato en el puerto serie (a través de la subrutina puertoSerie()).
+- Poner a nivel alto solo el indicador de alarma activa (led verde).
+- Indicar en la pantalla LCD qué la alarma debe desactivarse en menos de 20 segundos.
+- Comprobar si se ha marcado algún número (a través de la subrutina clavePin()).
+- Verificar si el número marcado es el correcto (claveBien o claveMal).
+Después de la verificación del número marcado, el programa irá al estado que le corresponda y notificará el cambio a la aplicación de c# enviando un dato a través del puerto serie.
+*/
+
+while (estado == 3){
+
+//   EEPROM.update(0, estado);
+
+ lcd.setBacklight(1);
+  
+tiempo = millis() + twatch2;
+watchmillis = millis();
+
+do {
+digitalWrite(leds, HIGH);
+delay(25);
+digitalWrite(leds, LOW);
+delay(25);
+digitalWrite(sirena, LOW);
+digitalWrite(buzzer, LOW);
+lcd.setCursor(0, 0);
+lcd.print("INTRUS");
+lcd.setCursor(0, 1);
+lcd.print("SIREN on");
+lcd.setCursor(13, 1);
+lcd.print("sec");
+
+        srest = (((watchmillis + twatch2) - millis()) % 60000) ;
+        secs = srest /1000;
+        
+        if (srest - (secs * 1000) <= 100){
+        digitalWrite(buzzer, HIGH);
+        delay(25);
+        digitalWrite(buzzer, LOW); 
+        }
+        
+        if (secs > 9){
+        lcd.setCursor(10,1);
+        }
+        else {
+        lcd.setCursor(10,1);
+        lcd.print("0");  
+        lcd.setCursor(11,1);
+        } 
+        lcd.print(secs);
+
+
+if (digitalRead(pir1) == HIGH){
+  beep(); 
+  lcd.setCursor(8, 0);
+  lcd.print("P1");
+}
+if (digitalRead(pir2) == HIGH){
+  beep(); 
+  lcd.setCursor(11, 0);
+  lcd.print("P2");
+}
+if (digitalRead(pir3) == HIGH){
+  beep(); 
+  lcd.setCursor(14, 0);
+  lcd.print("P3");
+}
+if (analogRead(magnet) == HIGH){
+  beep(); 
+  lcd.setCursor(15, 0);
+  lcd.print("M");
+}
+
+clavePin();
+remote();
+
+
+
+if (claveBien || value == remoteA || value == remoteB){
+estado = 0;
+EEPROM.update(0, estado);
+beep();
+delay(50);
+beep();
+
+if (value == remoteA || value == remoteB){
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300); 
+  }   
+
+lcd.clear();
+watchluz = millis();
+luz = 1;
+value = 0;
+claveBien = false;
+break;
+} 
+}  // end while estado3
+//----------------------------------------------
+
+while(tiempo > millis());
+
+remote();
+
+if (claveBien || value == remoteA || value == remoteB){
+estado = 0;
+EEPROM.update(0, estado);
+beep();
+delay(50);
+beep();
+
+if (value == remoteA || value == remoteB){ 
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300);  
+  }    
+
+lcd.clear();
+watchluz = millis();
+luz =1;
+value = 0;
+claveBien = false;
+}
+else if (claveMal){
+estado = 6;
+EEPROM.update(0, estado);
+watchluz = millis();
+beep();
+lcd.clear();
+luz = 1;
+claveMal = false;
+}
+else if (estado!= 0){
+estado = 4;
+EEPROM.update(0, estado);
+watchmillis = millis();
+watchluz = millis(); 
+beep();
+lcd.clear();
+luz = 1;
+alarms++;
+if (alarms >= 999){ intrus = 0;}
+EEPROM.put(22, alarms);
+}
+}  // end while tiempo
+//----------------------------------------------
+
+/* ESTADO 4
+  En el siguiente estado (estado '4') la sirena de la alarma está en funcionamiento y 
+  se necesita el código PIN para detener la alarma.
+  En este estado, el programa realizará de forma secuencial las siguientes acciones:
+- Comprobar si hay un dato en el puerto serie (a través de la subrutina puertoSerie()).
+- Poner a nivel alto el indicador de alarma activa (led verde).
+- Poner a nivel alto el relé que activa la sirena.
+- Indicar en la pantalla LCD qué la alarma qué la alarma está en funcionamiento y necesita clave para desactivarse.
+- Comprobar si se ha marcado algún número (a través de la subrutina clavePin()).
+- Verificar si el número marcado es el correcto (claveBien o claveMal).
+Después de la verificación del número marcado, el programa irá al estado que le corresponda y notificará el cambio a la aplicación de c# enviando un dato a través del puerto serie.
+*/
+while (estado == 4){
+
+ //  EEPROM.update(0, estado);
+
+ if (millis() - watchmillis >=  rearmado ){  
+ estado = 1;
+ EEPROM.update(0, estado);
+ beep();
+ luz = 1;
+ watchluz = millis();
+ claveBien = false;
+ }  
+ 
+  if (millis() - watchluz >= timeluz && luz == 1){  
+  lcd.setBacklight(0);
+  luz = 0;
+  }
+
+digitalWrite(leds, HIGH);
+digitalWrite(sirena, HIGH);
+digitalWrite(buzzer, HIGH);
+lcd.setCursor(0, 0);
+lcd.print("*  A L A R M  *  ");
+lcd.setCursor(0, 1);
+lcd.print("Deactivate  PIN ");
+
+delay(30);
+digitalWrite(buzzer, LOW);
+digitalWrite(leds, LOW);
+
+delay(30);
+
+clavePin();
+remote();
+
+if (claveBien || value == remoteA || value == remoteB){
+estado = 0;
+EEPROM.update(0, estado);
+beep();
+delay(50);
+beep();
+
+if (value == remoteA || value == remoteB){
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300); 
+  }    
+
+lcd.clear();
+watchluz = millis();
+luz = 1;
+value = 0;
+claveBien = false;
+}
+
+else if (claveMal){
+estado = 6;
+EEPROM.update(0, estado);
+watchmillis = millis();
+beep();
+lcd.clear();
+luz = 1;
+watchluz = millis();
+claveMal = false;
+}
+}  // end while estado4
+//----------------------------------------------
+/*                         ESTADO 5
+  En el siguiente estado (estado '5') el código PIN está bloqueado y se necesita el 
+  código PUK para activar la alarma.
+  En este estado, el programa realizará de forma secuencial las siguientes acciones:
+- Comprobar si hay un dato en el puerto serie (a través de la subrutina puertoSerie()).
+- Poner a nivel bajo las salidas leds, sirena y buzzer.
+- Indicar en la pantalla LCD qué el código PIN está bloqueado y se necesita introducir el código PUK para activar la alarma.
+- Comprobar si se ha marcado algún número (a través de la subrutina clavePuk()).
+- Verificar si el número marcado es el correcto (claveBien).
+Después de la verificación del número marcado, el programa irá al estado que le corresponda y notificará el cambio a la aplicación de c# enviando un dato a través del puerto serie.
+*/
+
+while (estado == 5){
+
+   EEPROM.update(0, estado);
+ 
+ if (millis() - watchmillis >=  rearmado ){  
+ estado = 1;
+ EEPROM.update(0, estado);
+ beep();
+ watchluz = millis();
+ luz = 1;
+ claveBien = false;
+ }
+ 
+  if (millis() - watchluz >= timeluz && luz == 1){  
+  lcd.setBacklight(0);
+  luz = 0;
+  }
+
+digitalWrite(leds, HIGH);
+digitalWrite(sirena, LOW);
+digitalWrite(buzzer, LOW);
+lcd.setCursor(0, 0);
+lcd.print("* PIN  Blocked *");
+lcd.setCursor(0, 1);
+lcd.print("Enter: PUK code");
+
+clavePuk();
+value = 0;
+remote();
+
+if (claveBien || value == remoteA || value == remoteB){
+estado = 0;
+EEPROM.update(0, estado);
+beep();
+delay(50);
+beep();
+
+if (value == remoteA || value == remoteB){
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300);  
+  }    
+
+lcd.clear();
+luz = 1;
+value = 0;
+watchluz = millis();
+digitalWrite(leds, LOW);
+claveBien = false;
+}
+}  // end while estado5
+//----------------------------------------------
+/*  ESTADO 6
+  En el siguiente estado (estado '6') el código PIN está bloqueado y se necesita el 
+  código PUK para desactivar la alarma.
+  En este estado, el programa realizará de forma secuencial las siguientes acciones:
+- Comprobar si hay un dato en el puerto serie (a través de la subrutina puertoSerie()).
+- Poner a nivel alto el indicador de alarma activa (led verde).
+- Poner a nivel alto el relé que activa la sirena.
+- Indicar en la pantalla LCD qué el código PIN está bloqueado y se necesita introducir el código PUK para desactivar la alarma.
+- Comprobar si se ha marcado algún número (a través de la subrutina clavePuk()).
+- Verificar si el número marcado es el correcto (claveBien).
+Después de la verificación del número marcado, el programa irá al estado que le corresponda y notificará el cambio a la aplicación de c# enviando un dato a través del puerto serie.
+*/
+
+while (estado == 6){
+
+//   EEPROM.update(0, estado);
+ 
+ if (millis() - watchmillis >=  rearmado ){  
+ estado = 1;
+ EEPROM.update(0, estado);
+ beep(); 
+ claveBien = false;
+ } 
+
+  if (millis() - watchluz >= timeluz && luz == 1){  
+  lcd.setBacklight(0);
+  luz = 0;
+ }
+
+digitalWrite(leds, HIGH);
+digitalWrite(sirena, HIGH);
+digitalWrite(buzzer, LOW);
+lcd.setCursor(0, 0);
+lcd.print("* ALARM *  Enter");
+lcd.setCursor(0, 1);
+lcd.print("Enter: PUK code");;
+
+delay(25);
+digitalWrite(leds, LOW);
+delay(25);
+
+clavePuk();
+remote();
+
+if (claveBien || value == remoteA || value == remoteB){
+estado = 0;
+EEPROM.update(0, estado);
+beep();
+delay(50);
+beep();
+
+if (value == remoteA || value == remoteB){ 
+    lcd.setCursor(12, 1);
+    lcd.print("****");
+    delay(300);  
+  }     
+
+lcd.clear();
+watchluz = millis();
+luz = 1;
+value = 0;
+claveBien = false;
+}
+}  // end while estado6
+//----------------------------------------------
+
+}  // end LOOP
+//-------------------------------------------------------------------------------------
+//---------------------------------------------------------------------------------
+/*  CLAVE PIN
+  Subrutina clavePin() ////
+  En esta subrutina el programa realizará de forma secuencial las siguientes acciones:
+- Detectar qué teclas han sido pulsadas.
+- Comprobar si el número pulsado coincide con el número secreto de la clave:
+Si esto es así, la variable booleana claveBien será verdadera, el LCD pondrá ‘clave correcta’ y el buzzer emitirá un bip corto.
+- Si por el contrario, el número no coincide con la clave secreta y se ha intentado introducirlo más de tres veces:
+La variable booleana claveMal será verdadera, el LCD pondrá ‘Pin bloqueado’ y el buzzer emitirá un bip largo.
+- Las teclas ‘*’ y ‘#’ se usarán para borrar las teclas presionadas y poder pulsar el código de nuevo.
+*/
+
+void clavePin(){
+
+key = keypad.getKey();
+
+if (key == '*' || key == '#'){
+beep();
+lcd.setBacklight(1);
+watchluz = millis();
+luz = 1;
+delay(50);
+}
+
+if (key >= '0'){
+posicion ++;  
+beep1();
+lcd.setBacklight(1);
+watchluz = millis();
+luz = 1;
+keydata = keydata + key;
+delay(50);
+}
+
+if (posicion == 4){
+if (keydata == codeA ||
+    keydata == codeB ||
+    keydata == code1 ||
+    keydata == code2 ||
+    keydata == code3){  
+claveBien = true;
+cntInt = 0;
+posicion = 0;
+lcd.clear();
+beep1();
+lcd.setCursor(0, 0);
+lcd.print("       PIN      ");
+lcd.setCursor(0, 1);
+lcd.print("     correct    ");
+    
+if (keydata == code1) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 1;
+    EEPROM.update(24,actualcode);
+    }
+if (keydata == code2) {
+    lastcode = actualcode; 
+    EEPROM.update(2,lastcode);
+    actualcode = 2;
+    EEPROM.update(24,actualcode);    
+    }
+if (keydata == code3) {
+    lastcode = actualcode; 
+    EEPROM.update(2,lastcode);
+    actualcode = 3;
+    EEPROM.update(24,actualcode);
+    }
+if (keydata == codeA) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 4;
+    EEPROM.update(24,actualcode);
+    }
+if (keydata == codeB) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 5;
+    EEPROM.update(24,actualcode); 
+    }
+
+keydata = "";
+delay(500);
+}   //  end if position 4
+else {
+cntInt ++;
+posicion = 0;
+keydata = "";
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print("       PIN      ");
+lcd.setCursor(0, 1);
+lcd.print("  *   ERROR   * ");
+digitalWrite(buzzer, HIGH);
+digitalWrite(leds, HIGH);
+delay(1000);
+digitalWrite(buzzer, LOW);
+digitalWrite(leds, LOW);
+lcd.clear();
+}    // end else
+}   // end position4
+
+if (cntInt == 3){
+cntInt = 0;
+claveMal = true;
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print("* PIN  Blocked *");
+lcd.setCursor(0, 1);
+lcd.print("Enter: PUK code");
+digitalWrite(leds, HIGH);
+digitalWrite(buzzer, HIGH);
+delay(1000);
+}
+}   // end clavepin
+//---------------------------------------------------------------------------------
+/*  CLAVE PIN2
+  Subrutina clavePin2() ////
+  En esta subrutina el programa realizará de forma secuencial las siguientes acciones:
+- Detectar qué teclas han sido pulsadas.
+- Comprobar si el número pulsado coincide con el número secreto de la clave:
+Si esto es así, la variable booleana claveBien será verdadera, el LCD pondrá ‘clave correcta’ y el buzzer emitirá un bip corto.
+- Si por el contrario, el número no coincide con la clave secreta y se ha intentado introducirlo más de tres veces:
+La variable booleana claveMal será verdadera, el LCD pondrá ‘Pin bloqueado’ y el buzzer emitirá un bip largo.
+- Las teclas ‘*’ y ‘#’ se usarán para borrar las teclas presionadas y poder pulsar el código de nuevo.
+*/
+
+void clavePin2(){
+
+key = keypad.getKey();
+
+if (key == '*' || key == '#'){
+beep();
+lcd.setBacklight(1);
+watchluz = millis();
+luz = 1;
+}
+
+if (key >= '0'){
+posicion ++;  
+beep1();
+lcd.setBacklight(1);
+watchluz = millis();
+iniciomillis = millis();
+luz = 1;
+keydata = keydata + key;
+delay(50);
+}
+
+if (posicion == 4){
+  
+  if (keydata == codeA ||
+      keydata == codeB ||
+      keydata == code1 ||
+      keydata == code2 ||
+      keydata == code3 ||
+      keydata == pindata ||
+      keydata == pinrdata ){   
+  claveBien = true;
+  cntInt = 0;
+  posicion = 0;
+  lcd.clear();
+  beep1();
+  lcd.setCursor(0, 0);
+  lcd.print("       PIN      ");
+  lcd.setCursor(0, 1);
+  lcd.print("     correct    ");
+
+if (keydata == code1) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 1;
+    EEPROM.update(24,actualcode);
+    }
+if (keydata == code2) {
+    lastcode = actualcode; 
+    EEPROM.update(2,lastcode);
+    actualcode = 2;
+    EEPROM.update(24,actualcode);    
+    }
+if (keydata == code3) {
+    lastcode = actualcode; 
+    EEPROM.update(2,lastcode);
+    actualcode = 3;
+    EEPROM.update(24,actualcode);
+    }
+if (keydata == codeA) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 4;
+    EEPROM.update(24,actualcode);
+    }
+if (keydata == codeB) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 5;
+    EEPROM.update(24,actualcode); 
+    }
+  
+  delay(500);
+  }   // end if keydata
+else {
+cntInt ++;
+posicion = 0;
+keydata = "";
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print("       PIN      ");
+lcd.setCursor(0, 1);
+lcd.print("  *   ERROR   * ");
+digitalWrite(buzzer, HIGH);
+digitalWrite(leds, HIGH);
+delay(1000);
+digitalWrite(buzzer, LOW);
+digitalWrite(leds, LOW);
+lcd.clear();
+}    // end else
+}   // end posicion4
+
+if (cntInt == 3){
+cntInt = 0;
+claveMal = true;
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print("* PIN  Blocked *");
+lcd.setCursor(0, 1);
+lcd.print("Enter: PUK code");
+digitalWrite(leds, HIGH);
+digitalWrite(buzzer, HIGH);
+delay(1000);
+}
+}   // end clavepin
+//---------------------------------------------------------------------------
+//---------------------------------------------------------------------------
+/*  CLAVE PUK
+  Subrutina clavePuk() ////
+  En esta subrutina el programa realizará de forma secuencial las siguientes acciones:
+- Detectar qué teclas han sido pulsadas.
+- Comprobar si el número pulsado coincide con el número secreto de la clave:
+Si esto es así, la variable booleana claveBien será verdadera, el LCD pondrá ‘clave correcta’ y el buzzer emitirá un bip corto.
+- Si por el contrario, el número no coincide con la clave secreta:
+El LCD pondrá ‘Clave errónea’ y el buzzer emitirá un bip largo.
+- Las teclas ‘*’ y ‘#’ se usarán para borrar las teclas presionadas y poder pulsar el código de nuevo.
+*/
+
+void clavePuk(){
+
+key = keypad.getKey();
+
+if (key == '*' || key == '#'){
+beep();
+lcd.setBacklight(1);
+}
+
+if (key >= '0'){
+posicion ++;
+beep1();
+lcd.setBacklight(1);
+keydata = keydata + key;
+delay(50);
+}
+
+// si no se teclean los 8 digitos, a los 10seg borra los tecleados
+if (millis() - iniciomillis >= timepin && posicion >0 && posicion <8){   
+  posicion = 0;
+  keydata = "";
+  beep1();  
+  lcd.setCursor(7, 1);
+  lcd.print("--------"); 
+  beep1();
+  delay(100);  
+  beep1();
+  iniciomillis = millis();  
+}
+
+if (posicion == 8){
+   if (keydata == puk){
+claveBien = true;
+posicion = 0;
+lcd.clear();
+digitalWrite(buzzer, HIGH);
+delay(100);
+digitalWrite(leds, LOW);
+digitalWrite(buzzer, LOW);
+lcd.setCursor(0, 0);
+lcd.print("       PUK      ");
+lcd.setCursor(0, 1);
+lcd.print("  *  correct  * ");
+delay(500);
+}   // end if keydata
+else {
+posicion = 0;
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print("       PUK      ");
+lcd.setCursor(0, 1);
+lcd.print("  *   ERROR   * ");
+digitalWrite(buzzer, HIGH);
+delay(1000);
+}
+}
+}   // end clavepuk
+//--------------------------------------------------------------------------
+void beep(){
+    digitalWrite(buzzer, HIGH);
+    delay(25);
+    digitalWrite(buzzer, LOW);
+}
+//-------------------------------------------------------
+void beep1(){
+    digitalWrite(buzzer, HIGH);
+    delay(100);
+    digitalWrite(buzzer, LOW);
+}
+//-------------------------------------------------------
+void beep2(){
+    digitalWrite(buzzer, HIGH);
+    delay(50);
+    digitalWrite(buzzer, LOW);
+}
+//------------------------------------------------------
+void siren(){
+digitalWrite(sirena, HIGH); 
+delay(50); 
+digitalWrite(sirena, LOW);
+}
+//-----------------------------------------------------
+void remote(){
+      
+     if (mySwitch.available()) {
+      value = mySwitch.getReceivedValue();
+  
+ if (value == remoteA || value == remoteB || value == remoteC || value == remoteD){
+      beep;
+      lcd.setBacklight(1);
+      watchluz = millis();
+      luz = 1;
+      cntRem = 0;
+      delay(100);
+if (value == remoteA) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 4;
+    EEPROM.update(24,actualcode);
+        
+    }
+if (value == remoteB) {
+    lastcode = actualcode;     
+    EEPROM.update(2,lastcode);
+    actualcode = 5;
+    EEPROM.update(24,actualcode);    
+    }
+    delay(500);      
+      } else {
+    digitalWrite(buzzer, HIGH);
+    digitalWrite(sirena, HIGH);     
+    delay(100);
+    digitalWrite(buzzer, LOW);
+    digitalWrite(sirena, LOW); 
+      lcd.setBacklight(1);
+      watchluz = millis();
+      cntRem++;
+      if (cntRem == 3){          // 3 intentos de envio de códigos erróneos
+         cntRem = 0;
+         value = 0;
+         estado = 6;             //  Cambia a estado 6 - PUK
+         EEPROM.update(0, estado);
+      }   // end if cntRem3
+ }    // end else
+
+      mySwitch.resetAvailable();
+     delay(200);
+     }  // end if myswitch 
+     
+}  // end void remote
+//-------------------------------------------------------
+void weprom(){
+
+  // grabar eeprom por primera vez
+       EEPROM.put(0, 0);         // estado  ultimo estado de la alarma
+       EEPROM.put(2, 0);         // Lastcode  ultimo codigo utilizado
+       EEPROM.put(5, "1111");    // code1
+       EEPROM.put(10, "2222");   // code2
+       EEPROM.put(15, "3333");   // code3
+       EEPROM.put(20, 0);        // intrusiones
+       EEPROM.put(22, 0);        // Alarmas
+       EEPROM.put(24, 0);        // Actualcode       
+}   // end void weprom
+//----------------------------------------------------------------
+void reprom(){   
+  
+   EEPROM.get(0, estado);
+   EEPROM.get(2, lastcode);
+   EEPROM.get(5, code1);
+   EEPROM.get(10, code2);
+   EEPROM.get(15, code3);
+   EEPROM.get(20, intrus);
+   EEPROM.get(22, alarms);  
+   EEPROM.get(24, actualcode);      
+ 
+/*
+// Para pruebas de eeprom
+  lcd.clear();  
+  lcd.setCursor(0,0);
+  lcd.print("Estado: ");     
+  lcd.print(estado);
+  
+  lcd.setCursor(0,1);
+  lcd.print("lastcode:  ");     
+  lcd.print(lastcode);
+  delay(3000);
+  
+  lcd.clear();              
+  lcd.setCursor(0,0);
+  lcd.print("1: ");
+  lcd.print(code1);
+  
+  lcd.setCursor(0,1);
+  lcd.print("2: ");
+  lcd.print(code2);
+ 
+  lcd.setCursor(8,0);
+  lcd.print("3: ");
+  lcd.print(code3);
+delay(3000);
+
+lcd.clear();
+  watchluz = millis();
+*/
+  
+}   // end void eprom
+//-----------------------------------
+void screen1(){
+  lcd.setCursor(0,0);
+  lcd.print("1 - ALARMA");
+  lcd.setCursor(0,1);
+  lcd.print("2 - MODIF.CLAVES");
+  iniciomillis = millis();  
+}   // end void screen1
+//------------------------------------------------------------------------
+void data(){
+  lcd.clear();
+  beep();
+  lcd.setBacklight(1);
+  lcd.setCursor(0,0);
+  lcd.print(" **   Data   ** ");
+  lcd.setCursor(0,1);
+  lcd.print(" ** Recorded ** ");
+  EEPROM.get(0, estado);
+  EEPROM.get(2, lastcode);    
+  EEPROM.get(20, intrus);
+  EEPROM.get(22, alarms);
+  EEPROM.get(24, actualcode);  
+  delay(500);
+ 
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Intru:");
+  lcd.setCursor(6,0);
+  lcd.print(intrus);
+    
+  lcd.setCursor(0,1);
+  lcd.print("Alarm:");
+  lcd.setCursor(6,1);
+  lcd.print(alarms);
+
+  lcd.setCursor(10,0);
+  lcd.print("Act:");
+  lcd.setCursor(14,0);  
+  lcd.print(actualcode);  
+  lcd.setCursor(10,1);
+  lcd.print("Ant:");
+  lcd.setCursor(14,1);
+  lcd.print(lastcode); 
+  delay(5000);
+  lcd.clear();
+  }  // end void data
+//----------------------------------------------------------------
